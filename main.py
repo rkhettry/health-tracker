@@ -1,5 +1,5 @@
 import streamlit as st
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -8,6 +8,9 @@ from pydantic import BaseModel
 from typing import List, Optional
 import json
 import pandas as pd
+import pytz
+from db import SupabaseRLS
+from streamlit_javascript import st_javascript
 
 # Load environment variables
 if os.path.exists(".env"):
@@ -22,14 +25,7 @@ else:
 
 # Initialize clients
 client = OpenAI(api_key=OPENAI_API_KEY)
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-# Global nutrition targets
-DAILY_TARGETS = {
-    'calories': 2410,
-    'protein': 180,
-    'fat': 70,
-    'carbs': 250,
-}
+
 
 
 # Data Models
@@ -37,9 +33,9 @@ class Meal(BaseModel):
     meal: str
     count: float
     calories: int
-    protein: Optional[float] = None
-    fat: Optional[float] = None
-    carbohydrates: Optional[float] = None
+    protein: float
+    fat: float
+    carbohydrates: float
 
 class MealListWithTotalCalories(BaseModel):
     meals: List[Meal]
@@ -58,7 +54,9 @@ def parse_daily_meals(daily_string: str) -> MealListWithTotalCalories:
                 2. If not, estimate calories based on typical portions
                 3. Estimate grams of protein, fat, and carbohydrates
                 4. Include reasonable calorie/macronutrient count guesses
-                5. Calculate totalCalories as the sum of all meals"""
+                5. Calculate totalCalories as the sum of all meals
+                
+                Never return null or empty values for any of these fields including calories, protein, fat, or carbohydrates. If you need to estimate, make a reasonable guess."""
             },
             {"role": "user", "content": f"Parse the following daily food intake into structured meal data: {daily_string}"}
         ],
@@ -74,59 +72,89 @@ def parse_daily_meals(daily_string: str) -> MealListWithTotalCalories:
 
     function_call = completion.choices[0].message.function_call
     meals_data = eval(function_call.arguments)
-    return MealListWithTotalCalories(**meals_data)
+    
+    # Additional validation to ensure no null values
+    result = MealListWithTotalCalories(**meals_data)
+    for meal in result.meals:
+        if any(v is None for v in meal.dict().values()):
+            raise ValueError("Meal contains null values which are not allowed")
+    return result
 
 def edit_meals(original_query: str, meals_string: str, edit_query: str) -> MealListWithTotalCalories:
     """Edit existing meals based on new input"""
     combined_query = f"{original_query}\n\nHere's the current meal list:\n{meals_string}\nEdit this meal list with the user requested edits from this query: \n{edit_query}"
     return parse_daily_meals(combined_query)
 
+def initialize_supabase_client():
+    if st.session_state.authenticated and st.session_state.user:
+        try:
+            # Create a new client instance each time
+            db = SupabaseRLS(SUPABASE_URL, SUPABASE_KEY)
+            # Need to sign in with stored credentials to get proper authentication
+            db.sign_in(st.session_state.user.email, st.session_state.user_password)
+            return db
+        except Exception as e:
+            st.error(f"Failed to initialize database: {str(e)}")
+            return None
+    return None
+
 def save_meals(meals: List[Meal], entry_date: date):
     """Save meals to Supabase"""
     try:
-        # First check if date exists
-        response = supabase.table('days')\
-            .select("id")\
-            .eq('date', entry_date.isoformat())\
-            .execute()
+        db = initialize_supabase_client()
+        if not db:
+            raise Exception("Not authenticated")
+
+        # First, check if day exists
+        days_response = db.select_data(
+            'days',
+            '*',
+            {'date': entry_date.isoformat(), 'user_id': st.session_state.user.id}
+        )
         
-        if not response.data:
-            # Create new day entry
-            day_response = supabase.table('days')\
-                .insert({"date": entry_date.isoformat()})\
-                .execute()
-            day_id = day_response.data[0]['id']
+        if not days_response:
+            # Create new day
+            day_response = db.insert_data('days', [{
+                "date": entry_date.isoformat(),
+                "user_id": st.session_state.user.id
+            }])
+            day_id = day_response[0]['id']
         else:
-            day_id = response.data[0]['id']
+            day_id = days_response[0]['id']
         
         # Insert meals
         meals_data = [{
             "day_id": day_id,
+            "user_id": st.session_state.user.id,
             **meal.dict()
         } for meal in meals]
         
-        response = supabase.table('meals')\
-            .insert(meals_data)\
-            .execute()
-        
-        return response.data
+        return db.insert_data('meals', meals_data)
     except Exception as e:
-        st.error(f"Error saving meals: {str(e)}")
-        return None
+        st.error(f"Failed to save meals: {str(e)}")
+        raise e
 
-def analyze_meal_macros(meal, DAILY_TARGETS):
+def analyze_meal_macros(meal, daily_targets):
     """
-    Dynamic analysis based on DAILY_TARGETS values.
+    Dynamic analysis based on daily_targets values.
     Returns color-coded evaluation of each macro based on proportions and ratios.
     """
+    if not daily_targets:
+        return {
+            'calories': {'percent': 0, 'color': '#666666', 'direction': None},
+            'protein': {'percent': 0, 'color': '#666666', 'direction': None},
+            'fat': {'percent': 0, 'color': '#666666', 'direction': None},
+            'carbs': {'percent': 0, 'color': '#666666', 'direction': None}
+        }
+        
     # Calculate percentages of daily targets
-    cal_percent = (meal['calories'] / DAILY_TARGETS['calories']) * 100
+    cal_percent = (meal['calories'] / daily_targets['calories']) * 100
     
     # Calculate target macro ratios in terms of calories
-    target_cals = DAILY_TARGETS['calories']
-    target_protein_cals = (DAILY_TARGETS['protein'] * 4)  # 30% of calories
-    target_fat_cals = (DAILY_TARGETS['fat'] * 9)         # 26% of calories
-    target_carb_cals = (DAILY_TARGETS['carbs'] * 4)      # 44% of calories
+    target_cals = daily_targets['calories']
+    target_protein_cals = (daily_targets['protein'] * 4)  # 30% of calories
+    target_fat_cals = (daily_targets['fat'] * 9)         # 26% of calories
+    target_carb_cals = (daily_targets['carbs'] * 4)      # 44% of calories
     
     # Calculate actual macro ratios for this meal
     meal_protein_cals = meal['protein'] * 4
@@ -174,382 +202,602 @@ def analyze_meal_macros(meal, DAILY_TARGETS):
     
     return evaluations
 
-# Streamlit UI
-st.title("Meal Logger")
 
-# Tab for creating/editing meals
-tab1, tab2, tab3 = st.tabs(["Log Meals", "View History", "Chat"])
+# After your imports and before the main app code
+def initialize_session_state():
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+    if 'user' not in st.session_state:
+        st.session_state.user = None
 
-with tab1:
-    # Input form
-    with st.form("meal_form"):
-        log_text = st.text_area(
-            "Enter your food log",
-            placeholder="Write everything you ate for the day like you're speaking to a friend"
-        )
-        
-        entry_date = st.date_input(
-            "Entry Date",
-            value=date.today(),
-            min_value=date.today() - timedelta(days=365),
-            max_value=date.today() + timedelta(days=365)
-        )
-        
-        preview_submit = st.form_submit_button("Preview Meals")
+def login_page():
+    st.title("Welcome!")
     
-    # Process and show preview when submitted
-    if preview_submit and log_text:
-        # Store the initial log text in session state
-        st.session_state['log_text'] = log_text
-        
-    # Check if we have a log to process
-    if 'log_text' in st.session_state:
-        try:
-            # Process the meals
-            if not 'current_meals' in st.session_state:
-                result = parse_daily_meals(st.session_state['log_text'])
-                st.session_state['current_meals'] = result
-            
-            # Convert meals to DataFrame for editing
-            meals_df = pd.DataFrame([{
-                'meal': meal.meal,
-                'calories': meal.calories,
-                'protein': meal.protein,
-                'fat': meal.fat,
-                'carbs': meal.carbohydrates,
-                'count': meal.count,
-            } for meal in st.session_state['current_meals'].meals])
-            
-            st.subheader("Processed Meals Preview:")
-            edited_df = st.data_editor(
-                meals_df,
-                column_config={
-                    "meal": st.column_config.TextColumn(
-                        "Meal Name",
-                        help="Description of the meal",
-                        width=300,
-                    ),
-                    "calories": st.column_config.NumberColumn(
-                        "Cal",
-                        help="Total calories",
-                        min_value=0,
-                        format="%d",
-                        width=70,
-                    ),
-                    "protein": st.column_config.NumberColumn(
-                        "Protein",
-                        help="Grams of protein",
-                        min_value=0,
-                        format="%.1fg",
-                        width=70,
-                    ),
-                    "fat": st.column_config.NumberColumn(
-                        "Fat",
-                        help="Grams of fat",
-                        min_value=0,
-                        format="%.1fg",
-                        width=70,
-                    ),
-                    "carbs": st.column_config.NumberColumn(
-                        "Carbs",
-                        help="Grams of carbohydrates",
-                        min_value=0,
-                        format="%.1fg",
-                        width=70,
-                    ),
-                    "count": st.column_config.NumberColumn(
-                        "×",
-                        help="Number of servings",
-                        min_value=0,
-                        max_value=10,
-                        step=0.5,
-                        format="%.1f",
-                        width=50,
-                    ),
-                },
-                hide_index=True,
-                disabled=["meal", "calories", "protein", "fat", "carbs", "count"],
-                num_rows="fixed"
-            )
-            
-            # Calculate and show totals using native Streamlit
-            if not edited_df.empty:
-                totals = edited_df.sum()
-                st.text(f"Totals: {int(totals['calories'])} cal | {totals['protein']:.1f}g protein | {totals['fat']:.1f}g fat | {totals['carbs']:.1f}g carbs")
-            
-            # Update session state with edited values
-            if edited_df is not None:
-                st.session_state['current_meals'].meals = [
-                    Meal(
-                        meal=row['meal'],
-                        count=row['count'],
-                        calories=row['calories'],
-                        protein=row['protein'],
-                        fat=row['fat'],
-                        carbohydrates=row['carbs']
-                    ) for _, row in edited_df.iterrows()
-                ]
-                st.session_state['current_meals'].totalCalories = int(edited_df['calories'].sum())
-            
-            # Always show modification section
-            st.subheader("Need to modify?")
-            edit_query = st.text_area(
-                "Enter your modifications here",
-                placeholder="Example: Change the calories of the first meal to 500, Add 2 eggs to breakfast",
-                key="edit_area"
-            )
-            
-            col1, col2 = st.columns(2)
-            
-            if col1.button("Modify"):
-                if edit_query:
-                    with st.spinner("Updating..."):
-                        modified_result = edit_meals(
-                            original_query=st.session_state['log_text'],
-                            meals_string=json.dumps(st.session_state['current_meals'].dict()),
-                            edit_query=edit_query
-                        )
-                        st.session_state['current_meals'] = modified_result
-                        st.rerun()
-            
-            if col2.button("Save"):
-                with st.spinner("Saving..."):
-                    if st.session_state.get('current_meals'):
-                        save_meals(st.session_state['current_meals'].meals, entry_date)
-                        st.success("Meals saved successfully!")
-                        # Clear the session state
-                        del st.session_state['current_meals']
-                        del st.session_state['log_text']
-                        st.rerun()
-                    
-        except Exception as e:
-            st.error(f"Error: {str(e)}")
-
-with tab2:
-    # Display daily targets in a compact table with smaller text
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.markdown("<div style='font-size: 0.8em;'>Daily Calories</div>", unsafe_allow_html=True)
-        st.markdown(f"<div style='font-size: 0.9em; font-weight: bold;'>{DAILY_TARGETS['calories']}</div>", unsafe_allow_html=True)
-    with col2:
-        st.markdown("<div style='font-size: 0.8em;'>Protein Target</div>", unsafe_allow_html=True)
-        st.markdown(f"<div style='font-size: 0.9em; font-weight: bold;'>{DAILY_TARGETS['protein']}g</div>", unsafe_allow_html=True)
-    with col3:
-        st.markdown("<div style='font-size: 0.8em;'>Fat Target</div>", unsafe_allow_html=True)
-        st.markdown(f"<div style='font-size: 0.9em; font-weight: bold;'>{DAILY_TARGETS['fat']}g</div>", unsafe_allow_html=True)
-    with col4:
-        st.markdown("<div style='font-size: 0.8em;'>Carbs Target</div>", unsafe_allow_html=True)
-        st.markdown(f"<div style='font-size: 0.9em; font-weight: bold;'>{DAILY_TARGETS['carbs']}g</div>", unsafe_allow_html=True)
-
-    # Display meal history
-    st.subheader("Meal History")
+    # Get the full URL including hash
+    url = st_javascript("await fetch('').then(r => window.parent.location.href)")
     
-    try:
-        # First get all days
-        days_response = supabase.table('days')\
-            .select("*")\
-            .order('date', desc=True)\
-            .execute()
+    # If we have a URL and it contains a hash, parse it
+    if url and '#' in url:
+        hash_part = url.split('#')[1]
+        # Convert the hash parameters to a dictionary
+        params = dict(param.split('=') for param in hash_part.split('&'))
+        
+        if params.get('type') == 'recovery':
+            # Show password reset form
+            st.subheader("Reset Your Password")
+            with st.form("recovery_password_form"):
+                new_password = st.text_input("New Password", type="password")
+                confirm_password = st.text_input("Confirm Password", type="password")
+                submitted = st.form_submit_button("Update Password")
+                
+                if submitted:
+                    if new_password != confirm_password:
+                        st.error("Passwords don't match!")
+                    elif len(new_password) < 6:
+                        st.error("Password must be at least 6 characters long!")
+                    else:
+                        try:
+                            db = SupabaseRLS(SUPABASE_URL, SUPABASE_KEY)
+                            # Get both tokens from parsed parameters
+                            access_token = params.get('access_token')
+                            refresh_token = params.get('refresh_token')
+                            
+                            if not access_token or not refresh_token:
+                                st.error("Link may have expired. Please request a new password reset link.")
+                                return
+                            
+                            # Update the password with both tokens
+                            db.update_password(
+                                new_password, 
+                                access_token=access_token,
+                                refresh_token=refresh_token
+                            )
+                            st.success("Password updated successfully! You can now log in with your new password.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error("Link may have expired. Please request a new password reset link.")
+            return  # Exit early, don't show other tabs
 
-        for day in days_response.data:
-            # Get meals for each day
-            meals_response = supabase.table('meals')\
-                .select("*")\
-                .eq('day_id', day['id'])\
-                .execute()
-            
-            # Calculate daily totals
-            total_calories = sum(meal['calories'] for meal in meals_response.data)
-            total_protein = sum(meal.get('protein', 0) or 0 for meal in meals_response.data)
-            total_fat = sum(meal.get('fat', 0) or 0 for meal in meals_response.data)
-            total_carbs = sum(meal.get('carbohydrates', 0) or 0 for meal in meals_response.data)
-            
-            # Calculate differences from targets
-            cal_diff = total_calories - DAILY_TARGETS['calories']
-            protein_diff = total_protein - DAILY_TARGETS['protein']
-            fat_diff = total_fat - DAILY_TARGETS['fat']
-            carbs_diff = total_carbs - DAILY_TARGETS['carbs']
-            
-            # Create a row with columns for the expander, nutrition summary, and delete button
-            cols = st.columns([3.5, 1.5, 0.5])
-            with cols[0]:
-                with st.expander(f"Meals for {day['date']}"):
-                    # Sort meals by calories in descending order
-                    meals = sorted(meals_response.data, key=lambda x: x['calories'], reverse=True)
-                    
-                    for meal in meals:
-                        # Get macro analysis
-                        analysis = analyze_meal_macros(meal, DAILY_TARGETS)
-                        
-                        # Show meal name and delete button in same row
-                        meal_row = st.columns([0.9, 0.1])
-                        meal_row[0].markdown(f"""
-                            <div style='margin: 0; padding: 0; line-height: 1; display: flex; align-items: center; min-height: 32px;'>• {meal['meal']} (x{meal['count']})</div>
-                            """, unsafe_allow_html=True)
-                        if meal_row[1].button("🗑️", key=f"delete_meal_{meal['id']}", help=""):
-                            with st.spinner("Deleting meal..."):
-                                supabase.table('meals')\
-                                    .delete()\
-                                    .eq('id', meal['id'])\
-                                    .execute()
-                                st.rerun()
-                        
-                        # Show nutritional info with color coding
-                        st.markdown(f"""
-                            <div style='margin: 0; padding: 0; line-height: 1; font-size: 0.9em; display: flex; align-items: center; min-height: 24px;'>
-                                Cal: <span style='color: {analysis['calories']['color']}'>{meal['calories']}{analysis['calories']['direction'] or ''}</span> | 
-                                Protein: <span style='color: {analysis['protein']['color']}'>{meal['protein']}g{analysis['protein']['direction'] or ''}</span> | 
-                                Fat: <span style='color: {analysis['fat']['color']}'>{meal['fat']}g{analysis['fat']['direction'] or ''}</span> | 
-                                Carbs: <span style='color: {analysis['carbs']['color']}'>{meal['carbohydrates']}g{analysis['carbs']['direction'] or ''}</span>
-                            </div>
-                            <hr style='margin: 3px 0; padding: 0;'>
-                            """, unsafe_allow_html=True)
-            
-            # Show nutrition summary with differences
-            with cols[1]:
-                # Calculate differences and determine colors/arrows using same logic as meals
-                cal_color = '#ff9999' if total_calories > (DAILY_TARGETS['calories'] * 1.1) else '#99cc99'
-                protein_color = '#ff9999' if total_protein < (DAILY_TARGETS['protein'] * 0.67) else '#666666' if total_protein < DAILY_TARGETS['protein'] else '#99cc99'
-                fat_color = '#ff9999' if total_fat > (DAILY_TARGETS['fat'] * 1.4) else '#666666' if total_fat > DAILY_TARGETS['fat'] else '#99cc99'
-                carbs_color = '#ff9999' if total_carbs > (DAILY_TARGETS['carbs'] * 1.4) else '#666666' if total_carbs > DAILY_TARGETS['carbs'] else '#99cc99'
-                
-                # Add arrows based on the same thresholds
-                cal_arrow = '↑' if total_calories > (DAILY_TARGETS['calories'] * 1.1) else ''
-                protein_arrow = '↓' if total_protein < (DAILY_TARGETS['protein'] * 0.67) else ''
-                fat_arrow = '↑' if total_fat > (DAILY_TARGETS['fat'] * 1.4) else ''
-                carbs_arrow = '↑' if total_carbs > (DAILY_TARGETS['carbs'] * 1.4) else ''
-                
-                st.markdown(f"""
-                    <div style='font-size: 0.9em; line-height: 1.2;'>
-                        <div>Cal: <span style='color: {cal_color}'>{total_calories}{cal_arrow}</span></div>
-                        <div style='font-size: 0.8em; color: #666;'>
-                            Protein: <span style='color: {protein_color}'>{total_protein}g{protein_arrow}</span><br>
-                            Fat: <span style='color: {fat_color}'>{total_fat}g{fat_arrow}</span><br>
-                            Carbs: <span style='color: {carbs_color}'>{total_carbs}g{carbs_arrow}</span>
-                        </div>
-                    </div>
-                """, unsafe_allow_html=True)
-            
-            # Delete day button
-            if cols[2].button("🗑️", key=f"delete_day_{day['id']}", help=""):
-                with st.spinner("Deleting day..."):
-                    supabase.table('meals')\
-                        .delete()\
-                        .eq('day_id', day['id'])\
-                        .execute()
-                    supabase.table('days')\
-                        .delete()\
-                        .eq('id', day['id'])\
-                        .execute()
+    # Regular login tabs for non-recovery flow
+    tab_login, tab_signup, tab_reset = st.tabs(["Login", "Sign Up", "Reset Password"])
+
+    with tab_login:
+        st.subheader("Log In")
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_password")
+            submitted_login = st.form_submit_button("Login")
+           
+            if submitted_login:
+                try:
+                    db = SupabaseRLS(SUPABASE_URL, SUPABASE_KEY)
+                    auth_response = db.sign_in(email, password)
+                    st.session_state.authenticated = True
+                    st.session_state.user = auth_response["user"]
+                    # Store password for future db initializations
+                    st.session_state.user_password = password
+                    st.success(f"Logged in as {auth_response['user'].email}")
                     st.rerun()
-    except Exception as e:
-        st.error(f"Error fetching meal history: {str(e)}")
+                except Exception as e:
+                    st.error(f"Login failed: {str(e)}")
 
-with tab3:
-    st.subheader("Nutrition Assistant")
-    
-    # Initialize chat history in session state if not exists
-    if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = []
-    
-    # Display chat history
-    for message in st.session_state.chat_messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-            if message.get("data") is not None:
-                st.dataframe(message["data"])
-    
-    # Chat input and date selector side by side
-    cols = st.columns([4, 1])
-    with cols[0]:
-        user_input = st.chat_input("Ask a question or log your meals...")
-    with cols[1]:
-        selected_date = st.date_input("Date", value=date.today())
-    
-    if user_input:
-        # Add user message to chat
-        st.session_state.chat_messages.append({"role": "user", "content": user_input})
+    with tab_signup:
+        st.subheader("Sign Up")
+        with st.form("signup_form"):
+            email_signup = st.text_input("Email", key="signup_email")
+            password_signup = st.text_input("Password", type="password", key="signup_password")
+            submitted_signup = st.form_submit_button("Sign Up")
+            
+            if submitted_signup:
+                try:
+                    db = SupabaseRLS(SUPABASE_URL, SUPABASE_KEY)
+                    auth_response = db.sign_up(email_signup, password_signup)
+                    st.success("Sign-up successful! Check your email to confirm your account.")
+                except Exception as e:
+                    st.error(f"Sign-up failed: {str(e)}")
+
+    with tab_reset:
+        st.subheader("Reset Password")
         
-        # Classify intent
-        completion = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{
-                "role": "system",
-                "content": "Classify if this is a meal logging action or a question about nutrition/history."
-            }, {
-                "role": "user",
-                "content": user_input
-            }],
-            functions=[{
-                "name": "classify_intent",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "intent": {"type": "string", "enum": ["log_meal", "question"]}
-                    }
-                }
-            }],
-            function_call={"name": "classify_intent"}
-        )
+        if 'reset_email_sent' not in st.session_state:
+            st.session_state.reset_email_sent = False
+            
+        if not st.session_state.reset_email_sent:
+            # Show the initial password reset form
+            with st.form("reset_form"):
+                reset_email = st.text_input("Email", key="reset_email")
+                submitted_reset = st.form_submit_button("Send Reset Link")
+                
+                if submitted_reset and reset_email:
+                    try:
+                        db = SupabaseRLS(SUPABASE_URL, SUPABASE_KEY)
+                        db.request_password_reset(reset_email)
+                        st.session_state.reset_email_sent = True
+                        st.success("Password reset link sent! Please check your email.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Failed to send reset link: {str(e)}")
         
-        intent = json.loads(completion.choices[0].message.function_call.arguments)["intent"]
+        else:
+            # Show the new password form after email is sent
+            st.info("Please check your email for the password reset link. Once you've clicked it, you can set your new password here:")
+            with st.form("new_password_form"):
+                new_password = st.text_input("New Password", type="password")
+                confirm_password = st.text_input("Confirm Password", type="password")
+                submitted_new_pw = st.form_submit_button("Update Password")
+                
+                if submitted_new_pw:
+                    if new_password != confirm_password:
+                        st.error("Passwords don't match!")
+                    elif len(new_password) < 6:
+                        st.error("Password must be at least 6 characters long!")
+                    else:
+                        try:
+                            db = SupabaseRLS(SUPABASE_URL, SUPABASE_KEY)
+                            db.update_password(new_password)
+                            st.session_state.reset_email_sent = False
+                            st.success("Password updated successfully! You can now log in with your new password.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to update password: {str(e)}")
+            
+            if st.button("Start Over"):
+                st.session_state.reset_email_sent = False
+                st.rerun()
+
+def main():
+    if 'error_info' in st.session_state:
+        st.error("Previous Error:")
+        st.json(st.session_state['error_info'])
+        if st.button("Clear Error"):
+            del st.session_state['error_info']
+            del st.session_state['debug_info']
+            st.rerun()
+    
+
+    initialize_session_state()
+    
+    # Show login page if not authenticated
+    if not st.session_state.authenticated:
+        login_page()
+        return
+    
+    #st.write(st.session_state.user)
+    # Create a small container for the logout button in the top right
+    col1, col2 = st.columns([6, 1])
+    with col2:
+        if st.button("Logout", type="secondary", use_container_width=True):
+            try:
+                db = initialize_supabase_client()
+                if db:
+                    db.sign_out()
+                st.session_state.authenticated = False
+                st.session_state.user = None
+                st.rerun()
+            except Exception as e:
+                st.error(f"Logout failed: {str(e)}")
+    with col1:
+        st.title("Meal Logger")
+    
+    # Your existing app code goes here
+    tab1, tab2 = st.tabs(["Log Meals", "View History"])
+
+    with tab1:
+        # Get current Pacific time
+        pacific = pytz.timezone('America/Los_Angeles')
+        now = datetime.now(pacific)
         
-        if intent == "log_meal":
-            # Parse meals
-            result = parse_daily_meals(user_input)
-            
-            # Convert to DataFrame for display
-            meals_df = pd.DataFrame([{
-                'meal': meal.meal,
-                'calories': meal.calories,
-                'protein': meal.protein,
-                'fat': meal.fat,
-                'carbs': meal.carbohydrates,
-                'count': meal.count,
-            } for meal in result.meals])
-            
-            # Add assistant response with DataFrame
-            st.session_state.chat_messages.append({
-                "role": "assistant",
-                "content": "Here's what I understood from your meal log. Does this look correct?",
-                "data": meals_df
-            })
-            
-        else:  # question intent
-            # Get historical context
-            days_response = supabase.table('days')\
-                .select("*")\
-                .order('date', desc=True)\
-                .limit(7)\
-                .execute()
-            
-            meals_history = []
-            for day in days_response.data:
-                meals_response = supabase.table('meals')\
-                    .select("*")\
-                    .eq('day_id', day['id'])\
-                    .execute()
-                meals_history.extend(meals_response.data)
-            
-            # Generate response with context
-            completion = client.chat.completions.create(
-                model="gpt-4",
-                messages=[{
-                    "role": "system",
-                    "content": f"""You are a nutrition assistant. Answer questions using this context:
-                    Daily Targets: {json.dumps(DAILY_TARGETS)}
-                    Recent meals: {json.dumps(meals_history)}"""
-                }, {
-                    "role": "user",
-                    "content": user_input
-                }]
+        # If it's before 5am, use previous day's date
+        entry_date_default = now.date() if now.hour >= 5 else (now - timedelta(days=1)).date()
+        
+        # Input form
+        with st.form("meal_form"):
+            log_text = st.text_area(
+                "Enter your food log",
+                placeholder="Write everything you ate for the day like you're speaking to a friend"
             )
             
-            # Add assistant response
-            st.session_state.chat_messages.append({
-                "role": "assistant",
-                "content": completion.choices[0].message.content
-            })
+            entry_date = st.date_input(
+                "Entry Date",
+                value=entry_date_default,
+                min_value=date.today() - timedelta(days=365),
+                max_value=date.today() + timedelta(days=365)
+            )
+            
+            preview_submit = st.form_submit_button("Preview Meals")
         
-        # Rerun to update chat display
-        st.rerun()
+        # Process and show preview when submitted
+        if preview_submit and log_text:
+            # Store the initial log text in session state
+            st.session_state['log_text'] = log_text
+            
+        # Check if we have a log to process
+        if 'log_text' in st.session_state:
+            try:
+                # Process the meals
+                if not 'current_meals' in st.session_state:
+                    result = parse_daily_meals(st.session_state['log_text'])
+                    st.session_state['current_meals'] = result
+                
+                # Convert meals to DataFrame for editing
+                meals_df = pd.DataFrame([{
+                    'meal': meal.meal,
+                    'calories': meal.calories,
+                    'protein': meal.protein,
+                    'fat': meal.fat,
+                    'carbs': meal.carbohydrates,
+                    'count': meal.count,
+                } for meal in st.session_state['current_meals'].meals])
+                
+                st.subheader("Processed Meals Preview:")
+                edited_df = st.data_editor(
+                    meals_df,
+                    column_config={
+                        "meal": st.column_config.TextColumn(
+                            "Meal Name",
+                            help="Description of the meal",
+                            width=300,
+                        ),
+                        "calories": st.column_config.NumberColumn(
+                            "Cal",
+                            help="Total calories",
+                            min_value=0,
+                            format="%d",
+                            width=70,
+                        ),
+                        "protein": st.column_config.NumberColumn(
+                            "Protein",
+                            help="Grams of protein",
+                            min_value=0,
+                            format="%.1fg",
+                            width=70,
+                        ),
+                        "fat": st.column_config.NumberColumn(
+                            "Fat",
+                            help="Grams of fat",
+                            min_value=0,
+                            format="%.1fg",
+                            width=70,
+                        ),
+                        "carbs": st.column_config.NumberColumn(
+                            "Carbs",
+                            help="Grams of carbohydrates",
+                            min_value=0,
+                            format="%.1fg",
+                            width=70,
+                        ),
+                        "count": st.column_config.NumberColumn(
+                            "×",
+                            help="Number of servings",
+                            min_value=0,
+                            max_value=10,
+                            step=0.5,
+                            format="%.1f",
+                            width=50,
+                        ),
+                    },
+                    hide_index=True,
+                    disabled=["meal", "calories", "protein", "fat", "carbs", "count"],
+                    num_rows="fixed"
+                )
+                
+                # Calculate and show totals using native Streamlit
+                if not edited_df.empty:
+                    totals = edited_df.sum()
+                    st.text(f"Totals: {int(totals['calories'])} cal | {totals['protein']:.1f}g protein | {totals['fat']:.1f}g fat | {totals['carbs']:.1f}g carbs")
+                
+                # Update session state with edited values
+                if edited_df is not None:
+                    st.session_state['current_meals'].meals = [
+                        Meal(
+                            meal=row['meal'],
+                            count=row['count'],
+                            calories=row['calories'],
+                            protein=row['protein'],
+                            fat=row['fat'],
+                            carbohydrates=row['carbs']
+                        ) for _, row in edited_df.iterrows()
+                    ]
+                    st.session_state['current_meals'].totalCalories = int(edited_df['calories'].sum())
+                
+                # Always show modification section
+                st.subheader("Need to modify?")
+                edit_query = st.text_area(
+                    "Enter your modifications here",
+                    placeholder="Example: Change the calories of the first meal to 500, Add 2 eggs to breakfast",
+                    key="edit_area"
+                )
+                
+                col1, col2 = st.columns(2)
+                
+                if col1.button("Modify"):
+                    if edit_query:
+                        with st.spinner("Updating..."):
+                            modified_result = edit_meals(
+                                original_query=st.session_state['log_text'],
+                                meals_string=json.dumps(st.session_state['current_meals'].dict()),
+                                edit_query=edit_query
+                            )
+                            st.session_state['current_meals'] = modified_result
+                            st.rerun()
+                
+                if col2.button("Save"):
+                    with st.spinner("Saving..."):
+                        if st.session_state.get('current_meals'):
+                            save_meals(st.session_state['current_meals'].meals, entry_date)
+                            st.success("Meals saved successfully!")
+                            # Clear the session state
+                            del st.session_state['current_meals']
+                            del st.session_state['log_text']
+                            st.rerun()
+                        
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
+
+
+
+    def get_user_targets(db):
+        """Get targets for the current user"""
+        try:
+            targets = db.select_data(
+                'targets',
+                '*',
+                match_dict={'user_id': st.session_state.user.id}
+            )
+            if targets:
+                return {
+                    'calories': targets[0]['calories'],
+                    'protein': targets[0]['protein'],
+                    'fat': targets[0]['fat'],
+                    'carbs': targets[0]['carbs']
+                }
+            return None
+        except Exception as e:
+            st.error(f"Failed to get targets: {str(e)}")
+            return None
+
+    def save_user_targets(db, targets_dict):
+        """Save or update targets for the current user"""
+        try:
+            existing_targets = db.select_data(
+                'targets',
+                '*',
+                match_dict={'user_id': st.session_state.user.id}
+            )
+            
+            data = {
+                'user_id': st.session_state.user.id,
+                **targets_dict
+            }
+            
+            if existing_targets:
+                # Update existing targets
+                db.update_data('targets', 
+                            match_dict={'user_id': st.session_state.user.id},
+                            new_data=data)
+            else:
+                # Insert new targets
+                db.insert_data('targets', data)
+            return True
+        except Exception as e:
+            st.error(f"Failed to save targets: {str(e)}")
+            return False
+
+    with tab2:
+        db = initialize_supabase_client()
+        if not db:
+            st.error("Please log in again")
+            return
+
+        user_targets = get_user_targets(db)
+        
+        # Display targets section
+        st.subheader("Daily Targets")
+        
+        if 'editing_targets' not in st.session_state:
+            st.session_state.editing_targets = False
+        
+        # Create two columns - one for targets, one for edit button
+        col1, col2 = st.columns([4, 1])
+        
+        with col1:
+            if not user_targets:
+                # Show input form for new targets
+                with st.form("targets_form"):
+                    new_calories = st.number_input("Daily Calories", min_value=0, value=2000)
+                    new_protein = st.number_input("Protein (g)", min_value=0, value=150)
+                    new_fat = st.number_input("Fat (g)", min_value=0, value=70)
+                    new_carbs = st.number_input("Carbs (g)", min_value=0, value=250)
+                    
+                    if st.form_submit_button("Save Targets"):
+                        targets_dict = {
+                            'calories': new_calories,
+                            'protein': new_protein,
+                            'fat': new_fat,
+                            'carbs': new_carbs
+                        }
+                        if save_user_targets(db, targets_dict):
+                            st.success("Targets saved!")
+                            st.rerun()
+            
+            elif st.session_state.editing_targets:
+                # Show edit form
+                with st.form("edit_targets_form"):
+                    edit_calories = st.number_input("Daily Calories", min_value=0, value=user_targets['calories'])
+                    edit_protein = st.number_input("Protein (g)", min_value=0, value=user_targets['protein'])
+                    edit_fat = st.number_input("Fat (g)", min_value=0, value=user_targets['fat'])
+                    edit_carbs = st.number_input("Carbs (g)", min_value=0, value=user_targets['carbs'])
+                    
+                    if st.form_submit_button("Save Changes"):
+                        targets_dict = {
+                            'calories': edit_calories,
+                            'protein': edit_protein,
+                            'fat': edit_fat,
+                            'carbs': edit_carbs
+                        }
+                        if save_user_targets(db, targets_dict):
+                            st.success("Targets updated!")
+                            st.session_state.editing_targets = False
+                            st.rerun()
+            
+            else:
+                # Display current targets
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.markdown("<div style='font-size: 0.8em;'>Daily Calories</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div style='font-size: 0.9em; font-weight: bold;'>{user_targets['calories']}</div>", unsafe_allow_html=True)
+                with col2:
+                    st.markdown("<div style='font-size: 0.8em;'>Protein Target</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div style='font-size: 0.9em; font-weight: bold;'>{user_targets['protein']}g</div>", unsafe_allow_html=True)
+                with col3:
+                    st.markdown("<div style='font-size: 0.8em;'>Fat Target</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div style='font-size: 0.9em; font-weight: bold;'>{user_targets['fat']}g</div>", unsafe_allow_html=True)
+                with col4:
+                    st.markdown("<div style='font-size: 0.8em;'>Carbs Target</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div style='font-size: 0.9em; font-weight: bold;'>{user_targets['carbs']}g</div>", unsafe_allow_html=True)
+        
+        with col2:
+            if user_targets and not st.session_state.editing_targets:
+                if st.button("Edit"):
+                    st.session_state.editing_targets = True
+                    st.rerun()
+            elif user_targets and st.session_state.editing_targets:
+                if st.button("Cancel"):
+                    st.session_state.editing_targets = False
+                    st.rerun()
+
+
+        # Display meal history
+        st.subheader("Meal History")
+        print("hello world 1")
+        try:
+            print("hello world 3")
+            db = initialize_supabase_client()
+            print("hello world 4")
+            if not db:
+                st.error("Please log in again")
+                return
+            print("hello world 5")
+
+            # Get all days for the user
+            days_response = db.select_data(
+                'days',
+                '*',
+                match_dict={'user_id': st.session_state.user.id},
+                order_by={'column': 'date', 'ascending': False}
+            )
+            print("hello world 6")
+            print("hello world")
+            print(days_response)
+
+            for day in days_response:
+                # Get meals for each day
+                meals_response = db.select_data(
+                    'meals',
+                    '*',
+                    match_dict={
+                        'day_id': day['id'],
+                        'user_id': st.session_state.user.id
+                    }
+                )
+                
+                
+                # Calculate daily totals with NULL handling
+                total_calories = sum(meal.get('calories', 0) or 0 for meal in meals_response)
+                total_protein = sum(meal.get('protein', 0) or 0 for meal in meals_response)
+                total_fat = sum(meal.get('fat', 0) or 0 for meal in meals_response)
+                total_carbs = sum(meal.get('carbohydrates', 0) or 0 for meal in meals_response)
+                
+                # Calculate differences from targets if they exist
+                if user_targets:
+                    cal_diff = total_calories - user_targets['calories']
+                    protein_diff = total_protein - user_targets['protein']
+                    fat_diff = total_fat - user_targets['fat']
+                    carbs_diff = total_carbs - user_targets['carbs']
+                else:
+                    cal_diff = protein_diff = fat_diff = carbs_diff = 0
+                
+                # Create a row with columns for the expander, nutrition summary, and delete button
+                cols = st.columns([3.5, 1.5, 0.5])
+                with cols[0]:
+                    with st.expander(f"Meals for {day['date']}"):
+                        # Sort meals by calories in descending order
+                        meals = sorted(meals_response, key=lambda x: x['calories'], reverse=True)
+                        
+                        for meal in meals:
+                            # Safely get values with defaults for NULL
+                            safe_meal = {
+                                'meal': meal.get('meal', 'Unknown'),
+                                'count': float(meal.get('count', 1) or 1),  # Default to 1 if NULL
+                                'calories': int(meal.get('calories', 0) or 0),
+                                'protein': float(meal.get('protein', 0) or 0),
+                                'fat': float(meal.get('fat', 0) or 0),
+                                'carbohydrates': float(meal.get('carbohydrates', 0) or 0)
+                            }
+                            
+                            if user_targets:
+                                analysis = analyze_meal_macros(safe_meal, user_targets)
+                            else:
+                                # Provide default analysis if no targets set
+                                analysis = {
+                                    'calories': {'color': '#666666', 'direction': None},
+                                    'protein': {'color': '#666666', 'direction': None},
+                                    'fat': {'color': '#666666', 'direction': None},
+                                    'carbs': {'color': '#666666', 'direction': None}
+                                }
+                            
+                            # Show meal name and delete button in same row
+                            meal_row = st.columns([0.9, 0.1])
+                            meal_row[0].markdown(f"""
+                                <div style='margin: 0; padding: 0; line-height: 1; display: flex; align-items: center; min-height: 32px;'>• {meal['meal']} (x{meal['count']})</div>
+                                """, unsafe_allow_html=True)
+                            if meal_row[1].button("🗑️", key=f"delete_meal_{meal['id']}", help=""):
+                                with st.spinner("Deleting meal..."):
+                                    db.delete_data('meals', {'id': meal['id']})
+                                    st.rerun()
+                            
+                            # Show nutritional info with color coding
+                            st.markdown(f"""
+                                <div style='margin: 0; padding: 0; line-height: 1; font-size: 0.9em; display: flex; align-items: center; min-height: 24px;'>
+                                    Cal: <span style='color: {analysis['calories']['color']}'>{meal['calories']}{analysis['calories']['direction'] or ''}</span> | 
+                                    Protein: <span style='color: {analysis['protein']['color']}'>{meal['protein']}g{analysis['protein']['direction'] or ''}</span> | 
+                                    Fat: <span style='color: {analysis['fat']['color']}'>{meal['fat']}g{analysis['fat']['direction'] or ''}</span> | 
+                                    Carbs: <span style='color: {analysis['carbs']['color']}'>{meal['carbohydrates']}g{analysis['carbs']['direction'] or ''}</span>
+                                </div>
+                                <hr style='margin: 3px 0; padding: 0;'>
+                                """, unsafe_allow_html=True)
+                
+                # Show nutrition summary with differences
+                with cols[1]:
+                    if user_targets:
+                        # Calculate differences and determine colors/arrows
+                        cal_color = '#ff9999' if total_calories > (user_targets['calories'] * 1.1) else '#99cc99'
+                        protein_color = '#ff9999' if total_protein < (user_targets['protein'] * 0.67) else '#666666' if total_protein < user_targets['protein'] else '#99cc99'
+                        fat_color = '#ff9999' if total_fat > (user_targets['fat'] * 1.4) else '#666666' if total_fat > user_targets['fat'] else '#99cc99'
+                        carbs_color = '#ff9999' if total_carbs > (user_targets['carbs'] * 1.4) else '#666666' if total_carbs > user_targets['carbs'] else '#99cc99'
+                    else:
+                        # Default colors if no targets set
+                        cal_color = protein_color = fat_color = carbs_color = '#666666'
+
+                    st.markdown(f"""
+                        <div style='font-size: 0.9em; line-height: 1.2;'>
+                            <div>Cal: <span style='color: {cal_color}'>{total_calories}</span></div>
+                            <div style='font-size: 0.8em; color: #666;'>
+                                Protein: <span style='color: {protein_color}'>{total_protein}g</span><br>
+                                Fat: <span style='color: {fat_color}'>{total_fat}g</span><br>
+                                Carbs: <span style='color: {carbs_color}'>{total_carbs}g</span>
+                            </div>
+                        </div>
+                    """, unsafe_allow_html=True)
+                
+                # Delete day button
+                if cols[2].button("🗑️", key=f"delete_day_{day['id']}", help=""):
+                    with st.spinner("Deleting day..."):
+                        db.delete_data('meals', {'day_id': day['id']})
+                        db.delete_data('days', {'id': day['id']})
+                        st.rerun()
+        except Exception as e:
+            st.error(f"Error fetching meal history: {str(e)}")
+
+if __name__ == "__main__":
+    main()
