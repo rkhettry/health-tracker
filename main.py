@@ -71,7 +71,6 @@ def parse_daily_meals(daily_string: str = "", image_data: bytes = None) -> MealL
 
         # Add content based on what was provided
         if image_data and daily_string:
-            # Both image and text
             base64_image = base64.b64encode(image_data).decode('utf-8')
             messages.append({
                 "role": "user",
@@ -89,7 +88,6 @@ def parse_daily_meals(daily_string: str = "", image_data: bytes = None) -> MealL
                 ]
             })
         elif image_data:
-            # Image only
             base64_image = base64.b64encode(image_data).decode('utf-8')
             messages.append({
                 "role": "user",
@@ -107,15 +105,13 @@ def parse_daily_meals(daily_string: str = "", image_data: bytes = None) -> MealL
                 ]
             })
         else:
-            # Text only
             messages.append({
                 "role": "user",
                 "content": f"Parse the following daily food intake into structured meal data: {daily_string}"
             })
 
-        
         completion = client.chat.completions.create(
-            model="gpt-4o",
+            model="gpt-4o",  # Updated to latest GPT-4 model
             messages=messages,
             functions=[
                 {
@@ -129,13 +125,10 @@ def parse_daily_meals(daily_string: str = "", image_data: bytes = None) -> MealL
         )
 
         function_call = completion.choices[0].message.function_call
-        meals_data = eval(function_call.arguments)
+        meals_data = json.loads(function_call.arguments)
         
         # Additional validation to ensure no null values
         result = MealListWithTotalCalories(**meals_data)
-        for meal in result.meals:
-            if any(v is None for v in meal.dict().values()):
-                raise ValueError("Meal contains null values which are not allowed")
         return result
         
     except Exception as e:
@@ -483,20 +476,19 @@ def main():
             preview_submit = st.form_submit_button("Preview Meals")
         
         # Process and show preview when submitted
-        st.session_state['log_text'] = None
-        if preview_submit and log_text:
-            # Store the initial log text in session state
-            st.session_state['log_text'] = log_text
-            
-        # Check if we have a log to process
-        if st.session_state['log_text'] or image_data:
+        if preview_submit and (log_text or uploaded_file):
+            # Store the initial log text in session state if it exists
+            if log_text:
+                st.session_state['log_text'] = log_text
+
+        # Check if we have data to process
+        if st.session_state.get('log_text') or image_data:
             try:
-                # Process the meals
-                if not 'current_meals' in st.session_state:
-                    result = parse_daily_meals(st.session_state['log_text'], image_data)
-                    print(result)
+                # Process the meals if not already processed
+                if 'current_meals' not in st.session_state:
+                    result = parse_daily_meals(st.session_state.get('log_text', ''), image_data)
                     st.session_state['current_meals'] = result
-                
+
                 # Convert meals to DataFrame for editing
                 meals_df = pd.DataFrame([{
                     'meal': meal.meal,
@@ -578,7 +570,7 @@ def main():
                     ]
                     st.session_state['current_meals'].totalCalories = int(edited_df['calories'].sum())
                 
-                # Always show modification section
+                # Modification section
                 st.subheader("Need to modify?")
                 edit_query = st.text_area(
                     "Enter your modifications here",
@@ -588,16 +580,22 @@ def main():
                 
                 col1, col2 = st.columns(2)
                 
-                if col1.button("Modify"):
+                if col1.button("Modify", key="modify_button"):
                     if edit_query:
                         with st.spinner("Updating..."):
-                            modified_result = edit_meals(
-                                original_query=st.session_state['log_text'],
-                                meals_string=json.dumps(st.session_state['current_meals'].dict()),
-                                edit_query=edit_query
-                            )
-                            st.session_state['current_meals'] = modified_result
-                            st.rerun()
+                            try:
+                                modified_result = edit_meals(
+                                    original_query=st.session_state['log_text'],
+                                    meals_string=json.dumps(st.session_state['current_meals'].dict()),
+                                    edit_query=edit_query
+                                )
+                                
+                                st.session_state['current_meals'] = modified_result
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error during modification: {str(e)}")
+                    else:
+                        st.warning("Please enter your modifications first.")
                 
                 if col2.button("Save"):
                     with st.spinner("Saving..."):
@@ -747,15 +745,11 @@ def main():
 
         # Display meal history
         st.subheader("Meal History")
-        print("hello world 1")
         try:
-            print("hello world 3")
             db = initialize_supabase_client()
-            print("hello world 4")
             if not db:
                 st.error("Please log in again")
                 return
-            print("hello world 5")
 
             # Get all days for the user
             days_response = db.select_data(
@@ -764,9 +758,6 @@ def main():
                 match_dict={'user_id': st.session_state.user.id},
                 order_by={'column': 'date', 'ascending': False}
             )
-            print("hello world 6")
-            print("hello world")
-            print(days_response)
 
             for day in days_response:
                 # Get meals for each day
