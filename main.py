@@ -779,9 +779,32 @@ def main():
                         # Default colors if no targets set
                         cal_color = protein_color = fat_color = carbs_color = '#666666'
 
+                    if user_targets:
+                        cal_diff = total_calories - user_targets['calories']
+                        if cal_diff < 0:
+                            # Under target (good if trying to lose weight)
+                            cal_remaining_color = '#99cc99'  # Light green
+                            cal_remaining_symbol = '↓'  # Down arrow
+                        elif cal_diff > 0:
+                            # Over target
+                            cal_remaining_color = '#ff9999'  # Light red
+                            cal_remaining_symbol = '↑'  # Up arrow
+                        else:
+                            # Exactly at target
+                            cal_remaining_color = '#666666'  # Gray
+                            cal_remaining_symbol = '='  # Equals sign
+                    else:
+                        cal_remaining_color = '#666666'
+                        cal_remaining_symbol = ''
+                        cal_diff = 0
+
                     st.markdown(f"""
                         <div style='font-size: 0.9em; line-height: 1.2;'>
-                            <div>Cal: <span style='color: {cal_color}'>{total_calories}</span></div>
+                            <div>Cal: <span style='color: {cal_color}'>{total_calories}</span>
+                                <span style='color: {cal_remaining_color}; font-size: 0.85em; margin-left: 4px;'>
+                                    {cal_remaining_symbol}{abs(cal_diff)}
+                                </span>
+                            </div>
                             <div style='font-size: 0.8em; color: #666;'>
                                 Protein: <span style='color: {protein_color}'>{total_protein}g</span><br>
                                 Fat: <span style='color: {fat_color}'>{total_fat}g</span><br>
