@@ -13,6 +13,10 @@ from db import SupabaseRLS
 from streamlit_javascript import st_javascript
 import base64
 
+import pandas as pd
+import altair as alt
+import pytz
+
 # Load environment variables
 if os.path.exists(".env"):
     load_dotenv()
@@ -438,7 +442,7 @@ def main():
         st.title("Meal Logger")
     
     # Your existing app code goes here
-    tab1, tab2 = st.tabs(["Log Meals", "View History"])
+    tab1, tab2, tab3 = st.tabs(["Log Meals", "View History", "Weekly Insights"])
 
     with tab1:
         # Get current Pacific time
@@ -895,6 +899,188 @@ def main():
                         st.rerun()
         except Exception as e:
             st.error(f"Error fetching meal history: {str(e)}")
+
+# =======================
+# INSIGHTS TAB (tab3)
+# =======================
+    with tab3:
+        st.title("Insights")
+
+        # --------------------------------------------
+        # 1. Initialize DB and fetch user targets
+        # --------------------------------------------
+        db = initialize_supabase_client()
+        if not db:
+            st.error("Please log in again.")
+            st.stop()
+
+        user_targets = get_user_targets(db)
+        if not user_targets:
+            st.info("No daily targets set. Please set your targets in the 'View History' tab to see insights.")
+            st.stop()
+
+        # --------------------------------------------
+        # 2. Fetch days and create a daily DataFrame
+        # --------------------------------------------
+        days_response = db.select_data(
+            'days',
+            '*',
+            match_dict={'user_id': st.session_state.user.id},
+            order_by={'column': 'date', 'ascending': True}  # chronological order
+        )
+
+        if not days_response:
+            st.info("No meal data found. Log some meals first to see insights!")
+            st.stop()
+
+        # Collect daily totals for each day
+        daily_rows = []
+        for day in days_response:
+            # Fetch all meals for that day
+            meals_response = db.select_data(
+                'meals',
+                '*',
+                match_dict={'day_id': day['id'], 'user_id': st.session_state.user.id}
+            )
+            total_calories = sum(m.get('calories', 0) or 0 for m in meals_response)
+            total_protein = sum(m.get('protein', 0) or 0 for m in meals_response)
+            total_fat = sum(m.get('fat', 0) or 0 for m in meals_response)
+            total_carbs = sum(m.get('carbohydrates', 0) or 0 for m in meals_response)
+
+            daily_rows.append({
+                "date": pd.to_datetime(day["date"]),
+                "calories": total_calories,
+                "protein": total_protein,
+                "fat": total_fat,
+                "carbs": total_carbs
+            })
+
+        daily_df = pd.DataFrame(daily_rows).sort_values(by="date")
+
+        # --------------------------------------------
+        # 3. Daily Macro Graph
+        # --------------------------------------------
+        st.subheader("Daily Macro Trends")
+
+        # Dropdown (or radio buttons) to pick which metric to visualize
+        metric_option = st.selectbox(
+            label="Select a metric to visualize daily trends:",
+            options=["calories", "protein", "fat", "carbs"],
+            index=0
+        )
+
+        # Build a line chart with Altair for the selected metric
+        # We'll also overlay a target line if relevant (for "calories" or "protein/fat/carbs"?)
+        base_chart = alt.Chart(daily_df).mark_line(point=True).encode(
+            x=alt.X("date:T", title="Date"),
+            y=alt.Y(metric_option + ":Q", title=metric_option.capitalize()),
+            tooltip=[
+                alt.Tooltip("date:T", title="Date"),
+                alt.Tooltip(metric_option + ":Q", title=metric_option.capitalize())
+            ]
+        ).properties(
+            width=700,
+            height=350
+        )
+
+        # If the user selected "calories", we can overlay the daily calorie target
+        # If macros, we can do the daily macro target. Let's do it generally:
+        daily_goal = user_targets[metric_option]  # e.g. user_targets["calories"] or user_targets["protein"]
+        rule = alt.Chart(pd.DataFrame({"y": [daily_goal]})).mark_rule(
+            strokeDash=[4, 4],
+            color="red"
+        ).encode(y="y:Q")
+
+        daily_chart = alt.layer(base_chart, rule).interactive()
+        st.altair_chart(daily_chart, use_container_width=True)
+
+        st.write(f"*Dashed line indicates your daily target for **{metric_option.capitalize()}** = {daily_goal}.*")
+
+        # --------------------------------------------
+        # 4. Weekly Insights
+        # --------------------------------------------
+        st.subheader("Weekly Insights")
+
+        # We'll group daily_df by calendar week and sum up each metric
+        # Use ISO calendar (year-week) for grouping
+        daily_df["year_week"] = daily_df["date"].dt.isocalendar().year.astype(str) + "-W" + \
+                                daily_df["date"].dt.isocalendar().week.astype(str)
+        weekly_df = (
+            daily_df.groupby("year_week", as_index=False)
+            .agg({
+                "calories": "sum",
+                "protein": "sum",
+                "fat": "sum",
+                "carbs": "sum"
+            })
+            .sort_values("year_week")
+        )
+
+        # Compute weekly goals (7 × daily targets)
+        weekly_goals = {
+            "calories": 7 * user_targets["calories"],
+            "protein": 7 * user_targets["protein"],
+            "fat": 7 * user_targets["fat"],
+            "carbs": 7 * user_targets["carbs"]
+        }
+
+        # Create a new DataFrame with over/under columns and "status"
+        week_insights = []
+        for _, row in weekly_df.iterrows():
+            w = row["year_week"]
+            cal_sum = row["calories"]
+            protein_sum = row["protein"]
+            fat_sum = row["fat"]
+            carbs_sum = row["carbs"]
+
+            # Differences from weekly goals
+            cal_diff = cal_sum - weekly_goals["calories"]
+            protein_diff = protein_sum - weekly_goals["protein"]
+            fat_diff = fat_sum - weekly_goals["fat"]
+            carbs_diff = carbs_sum - weekly_goals["carbs"]
+
+            # For a simple "success" measure, let's say:
+            #   - If calories are within ±10% of goal, and
+            #   - If protein, fat, carbs are each within ±20% of their respective goals
+            #   => "Successful week"
+            cals_ok = abs(cal_diff) <= 0.10 * weekly_goals["calories"]
+            prot_ok = abs(protein_diff) <= 0.20 * weekly_goals["protein"]
+            fat_ok  = abs(fat_diff) <= 0.20 * weekly_goals["fat"]
+            carbs_ok= abs(carbs_diff) <= 0.20 * weekly_goals["carbs"]
+
+            # A simple approach: all true => success, otherwise not
+            success = cals_ok and prot_ok and fat_ok and carbs_ok
+            status = "Success" if success else "Not in Range"
+
+            week_insights.append({
+                "Week": w,
+                "Total Calories": cal_sum,
+                "Cal Over/Under": cal_diff,
+                "Total Protein": protein_sum,
+                "Protein Over/Under": protein_diff,
+                "Total Fat": fat_sum,
+                "Fat Over/Under": fat_diff,
+                "Total Carbs": carbs_sum,
+                "Carbs Over/Under": carbs_diff,
+                "Status": status
+            })
+
+        insights_df = pd.DataFrame(week_insights)
+
+        # Show a cleaner table in Streamlit
+        st.dataframe(insights_df)
+
+        st.caption("""
+        - **Cal Over/Under** = Total weekly calories minus your weekly calorie goal (7 × daily cals).
+        - **Protein/Fat/Carbs Over/Under** = (Same idea for weekly macros).
+        - **Status** is a simple check:  
+        \t • "Success" if all metrics are within certain percentage thresholds  
+        \t • "Not in Range" otherwise.
+        """)
+
+        # (Optional) If you want a bar chart for each week's total cals vs. goal, protein vs. goal, etc., 
+        # you can add small altair charts here as well.
+
 
 if __name__ == "__main__":
     main()
