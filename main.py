@@ -11,6 +11,7 @@ import pandas as pd
 import pytz
 from db import SupabaseRLS
 from streamlit_javascript import st_javascript
+import base64
 
 # Load environment variables
 if os.path.exists(".env"):
@@ -41,14 +42,18 @@ class MealListWithTotalCalories(BaseModel):
     meals: List[Meal]
     totalCalories: int
 
-def parse_daily_meals(daily_string: str) -> MealListWithTotalCalories:
-    """Parse a daily food log into structured meal data"""
-    completion = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
+def parse_daily_meals(daily_string: str = "", image_data: bytes = None) -> MealListWithTotalCalories:
+    """Parse a daily food log and/or meal image into structured meal data"""
+    try:
+        # Ensure we have either text or image
+        if not daily_string and not image_data:
+            raise ValueError("Must provide either text description or image")
+        
+        # Base system message
+        messages = [
             {
                 "role": "system",
-                "content": """You are a helpful assistant. A user will provide you a list of foods they ate for the day. 
+                "content": """You are a helpful assistant. A user will provide you a list of foods they ate for the day and/or images of their meals. 
                 You will take this and break down everything they ate into meals. For each meal:
                 1. If calories were provided, use those
                 2. If not, estimate calories based on typical portions
@@ -57,28 +62,81 @@ def parse_daily_meals(daily_string: str) -> MealListWithTotalCalories:
                 5. Calculate totalCalories as the sum of all meals
                 
                 Never return null or empty values for any of these fields including calories, protein, fat, or carbohydrates. If you need to estimate, make a reasonable guess."""
-            },
-            {"role": "user", "content": f"Parse the following daily food intake into structured meal data: {daily_string}"}
-        ],
-        functions=[
-            {
-                "name": "parse_meals",
-                "description": "Parse meals from the given text",
-                "parameters": MealListWithTotalCalories.schema()
             }
-        ],
-        function_call={"name": "parse_meals"}
-    )
+        ]
 
-    function_call = completion.choices[0].message.function_call
-    meals_data = eval(function_call.arguments)
-    
-    # Additional validation to ensure no null values
-    result = MealListWithTotalCalories(**meals_data)
-    for meal in result.meals:
-        if any(v is None for v in meal.dict().values()):
-            raise ValueError("Meal contains null values which are not allowed")
-    return result
+        # Add content based on what was provided
+        if image_data and daily_string:
+            # Both image and text
+            base64_image = base64.b64encode(image_data).decode('utf-8')
+            messages.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Parse the following daily food intake and meal photo into structured meal data: {daily_string}"
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
+                    }
+                ]
+            })
+        elif image_data:
+            # Image only
+            base64_image = base64.b64encode(image_data).decode('utf-8')
+            messages.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Analyze this meal photo and provide the nutritional breakdown:"
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
+                    }
+                ]
+            })
+        else:
+            # Text only
+            messages.append({
+                "role": "user",
+                "content": f"Parse the following daily food intake into structured meal data: {daily_string}"
+            })
+
+        
+        completion = client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            functions=[
+                {
+                    "name": "parse_meals",
+                    "description": "Parse meals from the given text and/or image",
+                    "parameters": MealListWithTotalCalories.schema()
+                }
+            ],
+            function_call={"name": "parse_meals"},
+            max_tokens=500
+        )
+
+        function_call = completion.choices[0].message.function_call
+        meals_data = eval(function_call.arguments)
+        
+        # Additional validation to ensure no null values
+        result = MealListWithTotalCalories(**meals_data)
+        for meal in result.meals:
+            if any(v is None for v in meal.dict().values()):
+                raise ValueError("Meal contains null values which are not allowed")
+        return result
+        
+    except Exception as e:
+        st.error(f"Error in parse_daily_meals: {str(e)}")
+        raise
 
 def edit_meals(original_query: str, meals_string: str, edit_query: str) -> MealListWithTotalCalories:
     """Edit existing meals based on new input"""
@@ -404,19 +462,35 @@ def main():
                 max_value=date.today() + timedelta(days=365)
             )
             
+            uploaded_file = st.file_uploader("Take a photo of your meal (or upload one)", type=["jpg", "jpeg", "png"])
+            
+            image_data = None
+            if uploaded_file is not None:
+                
+                # Convert image to bytes
+                image_data = uploaded_file.getvalue()
+                
+                # Verify base64 encoding works
+                try:
+                    base64_test = base64.b64encode(image_data).decode('utf-8')
+                except Exception as e:
+                    st.error(f"Base64 encoding failed: {str(e)}")
+            
             preview_submit = st.form_submit_button("Preview Meals")
         
         # Process and show preview when submitted
+        st.session_state['log_text'] = None
         if preview_submit and log_text:
             # Store the initial log text in session state
             st.session_state['log_text'] = log_text
             
         # Check if we have a log to process
-        if 'log_text' in st.session_state:
+        if st.session_state['log_text'] or image_data:
             try:
                 # Process the meals
                 if not 'current_meals' in st.session_state:
-                    result = parse_daily_meals(st.session_state['log_text'])
+                    result = parse_daily_meals(st.session_state['log_text'], image_data)
+                    print(result)
                     st.session_state['current_meals'] = result
                 
                 # Convert meals to DataFrame for editing
