@@ -462,7 +462,7 @@ def main():
                 max_value=date.today() + timedelta(days=365)
             )
             
-            uploaded_file = st.file_uploader("Take a photo of your meal (or upload one)", type=["jpg", "jpeg", "png"])
+            uploaded_file = st.file_uploader("(Optional) Take a photo of your meal", type=["jpg", "jpeg", "png"])
             
             image_data = None
             if uploaded_file is not None:
